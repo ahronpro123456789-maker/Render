@@ -1,32 +1,19 @@
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
-const { createClient } = require('@supabase/supabase-js'); // Make sure to npm install @supabase/supabase-js
 const { generateOTPEmailHTML, generateOTPEmailText } = require('./emailTemplates');
+const fetch = require('node-fetch'); // ⭐️ REQUIRED for reCAPTCHA
+
 const app = express();
 
 // --- CONFIGURATION ---
-// Use the port Render provides, or 3000 for local testing
 const PORT = process.env.PORT || 3000;
-
-// Load sensitive data from Environment Variables
 const GMAIL_USER = process.env.GMAIL_USER;
 const GMAIL_PASS = process.env.GMAIL_PASS;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const CORS_ORIGIN = process.env.CORS_ORIGIN; // Your live frontend URL
-
-// Check if all required environment variables are set
-if (!GMAIL_USER || !GMAIL_PASS || !SUPABASE_URL || !SUPABASE_SERVICE_KEY || !CORS_ORIGIN) {
-  console.error('❌ FATAL ERROR: Missing one or more environment variables.');
-  // In a real app, you might stop the server: process.exit(1);
-}
-
-// --- Supabase Setup ---
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+const CORS_ORIGIN = process.env.CORS_ORIGIN;
+const RECAPTCHA_SECRET_KEY = process.env.RECAPTCHA_SECRET_KEY; // ⭐️ REQUIRED for reCAPTCHA
 
 // --- CORS Setup ---
-// Only allow requests from your live frontend
 const corsOptions = {
   origin: CORS_ORIGIN
 };
@@ -37,40 +24,66 @@ app.use(express.json());
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
-    user: GMAIL_USER, // Use variable
-    pass: GMAIL_PASS  // Use variable
+    user: GMAIL_USER,
+    pass: GMAIL_PASS
   }
 });
 
-// (Your /send-otp and /verify-otp routes from my previous message go here)
-// ... Make sure you are using the Supabase version of these routes ...
+// Using your in-memory otpStore
+const otpStore = {}; 
 
-// --- Send OTP to email (using Supabase) ---
+// --- ⭐️ UPDATED /send-otp ROUTE (with reCAPTCHA) ---
 app.post('/send-otp', async (req, res) => {
   console.log('📧 Received OTP request for:', req.body.email);
-  const { email } = req.body;
+
+  // 1. Get email and reCAPTCHA token
+  const { email, recaptchaToken } = req.body;
+
+  // 2. Verify the reCAPTCHA token (if provided)
+  if (recaptchaToken) {
+    console.log('🔍 Verifying reCAPTCHA token...');
+    
+    // Check if secret key is missing
+    if (!RECAPTCHA_SECRET_KEY) {
+        console.error('❌ FATAL: RECAPTCHA_SECRET_KEY is not set in environment variables.');
+        return res.status(500).json({ success: false, message: 'Server configuration error.' });
+    }
+
+    const verifyUrl = `https://www.google.com/recaptcha/api/siteverify?secret=${RECAPTCHA_SECRET_KEY}&response=${recaptchaToken}`;
+
+    try {
+      const recaptchaRes = await fetch(verifyUrl, { method: 'POST' });
+      const recaptchaData = await recaptchaRes.json();
+
+      if (!recaptchaData.success) {
+        console.log('❌ reCAPTCHA verification failed:', recaptchaData['error-codes']);
+        return res.status(400).json({ success: false, message: 'reCAPTCHA verification failed. Please try again.' });
+      }
+      console.log('✅ reCAPTCHA verified successfully.');
+    } catch (error) {
+      console.log('❌ reCAPTCHA server error:', error);
+      return res.status(500).json({ success: false, message: 'Could not verify reCAPTCHA.' });
+    }
+  } else {
+    // This is for the "resend" button, which is okay.
+    console.log('⚠️ No reCAPTCHA token provided, assuming resend.');
+  }
+
+  // 3. Check for email
   if (!email) {
     console.log('❌ No email provided');
     return res.status(400).json({ success: false, message: 'Email is required' });
   }
 
+  // 4. Generate OTP and save to in-memory store
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
-
-  const { error: dbError } = await supabase
-    .from('otp_tokens')
-    .upsert({
-      email: email,
+  otpStore[email] = {
       otp: otp,
-      created_at: new Date()
-    });
+      timestamp: Date.now() // Add timestamp for expiration
+  }; 
+  console.log('🔑 Generated OTP for', email, ':', otp);
 
-  if (dbError) {
-    console.error('❌ Supabase error:', dbError.message);
-    return res.status(500).json({ success: false, message: 'Failed to save OTP' });
-  }
-
-  console.log('🔑 Generated and saved OTP for', email, ':', otp);
-
+  // 5. Send the email
   let mailOptions;
   try {
     mailOptions = {
@@ -100,52 +113,47 @@ app.post('/send-otp', async (req, res) => {
   });
 });
 
-// --- Verify OTP (using Supabase) ---
-app.post('/verify-otp', async (req, res) => {
+
+// --- ⭐️ UPDATED /verify-otp ROUTE (using otpStore with expiration) ---
+app.post('/verify-otp', (req, res) => {
   console.log('🔍 Received OTP verification request for:', req.body.email);
+  
   const { email, otp } = req.body;
   if (!email || !otp) {
     console.log('❌ Missing email or OTP');
     return res.status(400).json({ success: false, message: 'Email and OTP required' });
   }
 
-  const { data, error } = await supabase
-    .from('otp_tokens')
-    .select('*')
-    .eq('email', email)
-    .single();
-
-  if (error || !data) {
-    console.log('❌ OTP not found or DB error for:', email);
+  const storedData = otpStore[email];
+  
+  if (!storedData) {
+    console.log('❌ No OTP found for:', email);
     return res.status(400).json({ success: false, message: "Invalid OTP or session expired" });
   }
 
-  console.log('🔑 Verifying OTP:', otp, 'against stored:', data.otp);
-
-  if (data.otp !== otp) {
+  console.log('🔑 Verifying OTP:', otp, 'against stored:', storedData.otp);
+  
+  // Check for expiration (5 minutes = 300000 ms)
+  const fiveMinutes = 5 * 60 * 1000;
+  if (Date.now() - storedData.timestamp > fiveMinutes) {
+      console.log('❌ Expired OTP for:', email);
+      delete otpStore[email]; // Clean up expired OTP
+      return res.status(400).json({ success: false, message: "OTP has expired. Please request a new one." });
+  }
+  
+  // Check if OTP matches
+  if (storedData.otp === otp) {
+    console.log('✅ OTP verified successfully for:', email);
+    delete otpStore[email]; // OTP used, remove from store
+    return res.json({ success: true, message: "OTP verified!" });
+  } else {
     console.log('❌ Invalid OTP for:', email);
     return res.status(400).json({ success: false, message: "Invalid OTP" });
   }
-
-  const otpTimestamp = new Date(data.created_at).getTime();
-  const now = new Date().getTime();
-  const fiveMinutes = 5 * 60 * 1000; // 5 minutes
-
-  if (now - otpTimestamp > fiveMinutes) {
-    console.log('❌ Expired OTP for:', email);
-    await supabase.from('otp_tokens').delete().eq('email', email);
-    return res.status(400).json({ success: false, message: "OTP has expired. Please request a new one." });
-  }
-
-  // Success! Delete the used OTP
-  await supabase.from('otp_tokens').delete().eq('email', email);
-  
-  console.log('✅ OTP verified successfully for:', email);
-  return res.json({ success: true, message: "OTP verified!" });
 });
 
 
-// --- Start Server ---
+// --- START SERVER ---
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
 });
