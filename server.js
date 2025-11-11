@@ -23,8 +23,8 @@ app.use(express.json());
 // --- Nodemailer Setup ---
 const transporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
-  port: 465, // Use 465 for SSL
-  secure: true, // Use SSL
+  port: 587, // Change port to 587
+  secure: false, // Change secure to false
   auth: {
     user: GMAIL_USER,
     pass: GMAIL_PASS
@@ -159,4 +159,5 @@ app.post('/verify-otp', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
 });
+
 
